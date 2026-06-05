@@ -22,6 +22,15 @@ exec > >(tee -a "$LOG") 2>&1
 echo "==== MIGRAÇÃO SAMBA AD ===="
 [ "$DRY_RUN" -eq 1 ] && echo "*** MODO DRY-RUN (simulacao, sem alteracoes) ***"
 
+# A migracao real altera /etc, instala pacotes e gerencia servicos: exige root.
+# O modo --dry-run nao toca no sistema, entao dispensa root.
+require_root() {
+  if [ "$DRY_RUN" -ne 1 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "❌ Este script precisa ser executado como root (use: sudo $0)."
+    exit 1
+  fi
+}
+
 # Executa um comando, ou apenas o exibe em modo dry-run.
 run() {
   echo ">> $*"
@@ -46,17 +55,72 @@ write_file() {
   printf '%s\n' "$content" > "$path"
 }
 
+check_clock() {
+  echo "⏱️  Verificando sincronizacao de relogio (NTP)..."
+  if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
+    echo "   OK: relogio sincronizado via NTP."
+    return 0
+  fi
+  echo "   ⚠️ Relogio NAO sincronizado por NTP. O Kerberos exige diferenca < 5 min;"
+  echo "      sincronize com o mesmo servidor de tempo do AD antes de prosseguir."
+  return 1
+}
+
+check_domain_reachable() {
+  echo "🔎 Verificando registros SRV do dominio $1..."
+  if host -t SRV "_ldap._tcp.$1" >/dev/null 2>&1; then
+    echo "   OK: registros SRV _ldap._tcp encontrados."
+    return 0
+  fi
+  echo "   ⚠️ Nao foi possivel resolver _ldap._tcp.$1. Confirme que o DNS aponta para o AD 2003."
+  return 1
+}
+
+check_dns_consistency() {
+  local host="$1" domain="$2" ip="$3"
+  local fqdn="$host.$domain"
+  echo "🌐 Verificando DNS direto/reverso de $fqdn ($ip)..."
+  if getent hosts "$fqdn" | grep -qw "$ip"; then
+    echo "   OK: $fqdn resolve para $ip."
+  else
+    echo "   ⚠️ $fqdn nao resolve para $ip."
+  fi
+  if getent hosts "$ip" | grep -qw "$fqdn"; then
+    echo "   OK: reverso de $ip aponta para $fqdn."
+  else
+    echo "   ⚠️ Reverso de $ip nao aponta para $fqdn."
+  fi
+}
+
+validate_prereqs() {
+  # args: dominio realm host ip
+  echo "===================================================="
+  echo " VALIDACAO DE PRE-REQUISITOS"
+  echo "===================================================="
+  check_clock || true
+  check_domain_reachable "$1" || true
+  check_dns_consistency "$3" "$1" "$4" || true
+  if [ "$2" != "$(echo "$2" | tr '[:lower:]' '[:upper:]')" ]; then
+    echo "   ⚠️ O realm '$2' nao esta em MAIUSCULAS."
+  fi
+}
+
 rollback() {
   echo "⚠️ Rollback..."
   run systemctl stop samba-ad-dc
   run rm -rf /var/lib/samba/*
 }
 
+require_root
+
 read -p "Dominio: " DOMAIN
 read -p "Realm: " REALM
 read -p "Admin: " ADMIN
 read -p "Hostname: " HOST
 read -p "IP: " IP
+
+validate_prereqs "$DOMAIN" "$REALM" "$HOST" "$IP"
+read -p "Revise os avisos de pre-requisitos acima. Enter para continuar... " _
 
 run apt update || rollback
 run apt install -y samba krb5-user winbind smbclient dnsutils || rollback

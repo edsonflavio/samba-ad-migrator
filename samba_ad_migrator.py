@@ -84,6 +84,84 @@ def rollback():
     log("Rollback concluído (parcial). Ambiente limpo.")
 
 # -------------------------
+# PRÉ-REQUISITOS
+# -------------------------
+def _capture(cmd):
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+
+def require_root():
+    # A migracao real altera /etc, instala pacotes e gerencia servicos: exige root.
+    # O modo --dry-run nao toca no sistema, entao dispensa root.
+    if DRY_RUN:
+        return
+    if os.geteuid() != 0:
+        error("Este script precisa ser executado como root (use: sudo python3 samba_ad_migrator.py).")
+        sys.exit(1)
+
+
+def check_clock():
+    log("⏱️  Verificando sincronização de relógio (NTP)...")
+    rc, out, _ = _capture("timedatectl show -p NTPSynchronized --value")
+    if rc == 0 and out == "yes":
+        log("   OK: relógio sincronizado via NTP.")
+        return True
+    log("   ⚠️ Relógio NÃO sincronizado por NTP. O Kerberos exige diferença < 5 min;")
+    log("      sincronize com o mesmo servidor de tempo do AD antes de prosseguir.")
+    return False
+
+
+def check_domain_reachable(domain):
+    log(f"🔎 Verificando registros SRV do domínio {domain}...")
+    rc, _out, _ = _capture(f"host -t SRV _ldap._tcp.{domain}")
+    if rc == 0:
+        log("   OK: registros SRV _ldap._tcp encontrados.")
+        return True
+    log(f"   ⚠️ Não foi possível resolver _ldap._tcp.{domain}. Confirme que o DNS")
+    log("      aponta para o AD 2003 de origem.")
+    return False
+
+
+def check_dns_consistency(hostname, domain, ip):
+    fqdn = f"{hostname}.{domain}"
+    log(f"🌐 Verificando DNS direto/reverso de {fqdn} ({ip})...")
+    ok = True
+    rc, out, _ = _capture(f"getent hosts {fqdn}")
+    if rc == 0 and ip in out.split():
+        log(f"   OK: {fqdn} resolve para {ip}.")
+    else:
+        log(f"   ⚠️ {fqdn} não resolve para {ip} (resultado: {out or 'vazio'}).")
+        ok = False
+    rc, out, _ = _capture(f"getent hosts {ip}")
+    if rc == 0 and fqdn in out.split():
+        log(f"   OK: reverso de {ip} aponta para {fqdn}.")
+    else:
+        log(f"   ⚠️ Reverso de {ip} não aponta para {fqdn} (resultado: {out or 'vazio'}).")
+        ok = False
+    return ok
+
+
+def validate_prereqs(domain, realm, hostname, ip):
+    log("====================================================")
+    log(" VALIDAÇÃO DE PRÉ-REQUISITOS")
+    log("====================================================")
+    results = [
+        check_clock(),
+        check_domain_reachable(domain),
+        check_dns_consistency(hostname, domain, ip),
+    ]
+    if realm != realm.upper():
+        log(f"   ⚠️ O realm '{realm}' não está em MAIÚSCULAS (esperado: {realm.upper()}).")
+        results.append(False)
+    if all(results):
+        log("✅ Pré-requisitos OK.")
+    else:
+        log("⚠️ Há avisos de pré-requisitos acima — revise antes de continuar.")
+    return all(results)
+
+
+# -------------------------
 # VALIDAÇÕES
 # -------------------------
 def check_dns(domain):
@@ -121,6 +199,8 @@ def main():
     args = parser.parse_args()
     DRY_RUN = args.dry_run
 
+    require_root()
+
     print("==============================================")
     print(" MIGRAÇÃO ENTERPRISE — SAMBA AD")
     if DRY_RUN:
@@ -135,7 +215,8 @@ def main():
 
     log("==== INício da migração ====")
 
-    input("\n⚠️ Confirme que DNS e NTP estão corretos. Enter para continuar...")
+    validate_prereqs(domain, realm, hostname, ip)
+    input("\n⚠️ Revise os avisos de pré-requisitos acima. Enter para continuar...")
 
     # -------------------------
     # INSTALAÇÃO
