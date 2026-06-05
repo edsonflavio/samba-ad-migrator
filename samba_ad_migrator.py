@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
 import subprocess
 import sys
@@ -8,11 +9,35 @@ from datetime import datetime
 
 LOG_FILE = "/var/log/samba-ad-migration.log"
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# Quando True, nenhum comando e executado e nenhum arquivo do sistema e alterado.
+DRY_RUN = False
+
+# Caminho efetivo do log (pode cair para um arquivo local quando /var/log nao e gravavel).
+ACTIVE_LOG = LOG_FILE
+
+
+def _setup_logging():
+    global ACTIVE_LOG
+    # /var/log exige root; cai para um arquivo local para permitir --dry-run sem root.
+    for path in (LOG_FILE, os.path.join(os.getcwd(), "samba-ad-migration.log")):
+        try:
+            logging.basicConfig(
+                filename=path,
+                level=logging.INFO,
+                format="%(asctime)s [%(levelname)s] %(message)s",
+            )
+            ACTIVE_LOG = path
+            return
+        except OSError:
+            continue
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    ACTIVE_LOG = "(stderr)"
+
+
+_setup_logging()
 
 def log(msg):
     print(msg)
@@ -24,6 +49,9 @@ def error(msg):
 
 def run(cmd, critical=True):
     log(f">> {cmd}")
+    if DRY_RUN:
+        log("   [DRY-RUN] comando nao executado")
+        return 0
     result = subprocess.run(cmd, shell=True)
     if result.returncode != 0:
         error(f"Erro ao executar: {cmd}")
@@ -31,6 +59,17 @@ def run(cmd, critical=True):
             rollback()
             sys.exit(1)
     return result.returncode
+
+
+def write_file(path, content):
+    log(f">> escrevendo {path}")
+    if DRY_RUN:
+        log(f"   [DRY-RUN] conteudo que seria gravado em {path}:")
+        for line in content.splitlines():
+            log(f"   | {line}")
+        return
+    with open(path, "w") as f:
+        f.write(content)
 
 # -------------------------
 # ROLLBACK
@@ -70,8 +109,22 @@ def check_replication():
 # MAIN
 # -------------------------
 def main():
+    global DRY_RUN
+    parser = argparse.ArgumentParser(
+        description="Migracao de AD (Windows) para Samba AD DC."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simula a migracao: nenhum comando e executado e nenhum arquivo e alterado.",
+    )
+    args = parser.parse_args()
+    DRY_RUN = args.dry_run
+
     print("==============================================")
     print(" MIGRAÇÃO ENTERPRISE — SAMBA AD")
+    if DRY_RUN:
+        print(" *** MODO DRY-RUN (simulacao, sem alteracoes) ***")
     print("==============================================")
 
     domain = input("Domínio: ")
@@ -95,8 +148,10 @@ def main():
     # -------------------------
     run(f"hostnamectl set-hostname {hostname}.{domain}")
 
-    with open("/etc/hosts", "w") as f:
-        f.write(f"127.0.0.1 localhost\n{ip} {hostname}.{domain} {hostname}\n")
+    write_file(
+        "/etc/hosts",
+        f"127.0.0.1 localhost\n{ip} {hostname}.{domain} {hostname}\n",
+    )
 
     # -------------------------
     # KERBEROS
@@ -109,8 +164,7 @@ def main():
         "aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 "
         "arcfour-hmac-md5 des-cbc-md5 des-cbc-crc"
     )
-    with open("/etc/krb5.conf", "w") as f:
-        f.write(f"""[libdefaults]
+    write_file("/etc/krb5.conf", f"""[libdefaults]
  default_realm = {realm}
  dns_lookup_realm = false
  dns_lookup_kdc = true
@@ -163,7 +217,7 @@ def main():
     log("✅ MIGRAÇÃO FINALIZADA COM SUCESSO")
 
     print("\n✅ MIGRAÇÃO CONCLUÍDA")
-    print(f"📄 Log completo: {LOG_FILE}")
+    print(f"📄 Log completo: {ACTIVE_LOG}")
     print("\nPróximos passos:")
     print("- Ajustar DNS dos clientes")
     print("- Testar autenticação")
