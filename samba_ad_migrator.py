@@ -101,11 +101,25 @@ def main():
     # -------------------------
     # KERBEROS
     # -------------------------
+    # O AD do Windows Server 2003 só oferece enctypes legados (RC4/DES).
+    # O krb5 do Debian Trixie desabilita crypto fraca por padrão, então
+    # habilitamos esses enctypes (mantendo AES para o novo DC Samba e clientes
+    # modernos) para que o kinit e o "domain join" consigam negociar com o 2003.
+    legacy_enctypes = (
+        "aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 "
+        "arcfour-hmac-md5 des-cbc-md5 des-cbc-crc"
+    )
     with open("/etc/krb5.conf", "w") as f:
         f.write(f"""[libdefaults]
  default_realm = {realm}
  dns_lookup_realm = false
  dns_lookup_kdc = true
+ allow_weak_crypto = true
+ allow_rc4 = true
+ allow_des3 = true
+ default_tkt_enctypes = {legacy_enctypes}
+ default_tgs_enctypes = {legacy_enctypes}
+ permitted_enctypes = {legacy_enctypes}
 """)
 
     check_dns(domain)
